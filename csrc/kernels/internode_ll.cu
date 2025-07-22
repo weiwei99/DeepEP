@@ -392,7 +392,7 @@ template <bool kUseLogFMT, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(1024, 1) void
 combine(void* combined_x,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
-        const void* x, const int32_t* topk_idx, const float* topk_weights,
+        const void* x, const int32_t* topk_idx_i32, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
         int* next_clean, int num_next_clean_int,
         int* atomic_clean_flag,
