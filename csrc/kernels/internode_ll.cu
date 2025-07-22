@@ -382,11 +382,17 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 #undef DISPATCH_LAUNCH_CASE
 }
 
+constexpr int kMaxNumTokensPerSm = 6;
+constexpr int kIdxOrWeightDim = 2;
+constexpr int kNumActualTopkDivFour = 2;
+constexpr int kNumActualTopk = kNumActualTopkDivFour * 4;
+constexpr int kWarpSize = 32;
+
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(1024, 1) void
 combine(void* combined_x,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
-        const void* x, const int64_t* topk_idx, const float* topk_weights,
+        const void* x, const int32_t* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
         int* next_clean, int num_next_clean_int,
         int* atomic_clean_flag,
@@ -614,42 +620,91 @@ combine(void* combined_x,
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
-    // Wait all ranks to arrive
-    if (responsible_expert_idx < num_experts) {
-        EP_DEVICE_ASSERT(num_warps_per_group > 1);
-        if (sub_warp_id == 0 and lane_id == 0) {
-            while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0);
-        }
+    int self_num_iteration = (sm_id >= num_combined_tokens) ? 0 : (1 + (num_combined_tokens - sm_id - 1) / num_sms);
+
+    alignas(16) __shared__ int4 shared_topk_info[kMaxNumTokensPerSm * kIdxOrWeightDim * kNumActualTopkDivFour];
+    const auto compute_shared_topk_info_addr = [=](int idx_iteration, int idx_iow, int idx_topkdivfour) {
+        return shared_topk_info
+            + idx_iteration * (kIdxOrWeightDim * kNumActualTopkDivFour)
+            + idx_iow * kNumActualTopkDivFour
+            + idx_topkdivfour;
+    };
+
+    int4 temp_buf;
+    int prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topkdivfour;
+    static_assert(sizeof(shared_topk_info) / sizeof(shared_topk_info[0]) <= kWarpSize);
+    if (warp_id == 0) {
+        int index = thread_id;
+        prepare_topk_idx_topkdivfour = index % kNumActualTopkDivFour;
+        index /= kNumActualTopkDivFour;
+        prepare_topk_idx_iow = index % kIdxOrWeightDim;
+        index /= kIdxOrWeightDim;
+        prepare_topk_idx_iteration = index;
     }
-    cg::this_grid().sync();
+    bool enable_prepare_topk = (warp_id == 0) and (prepare_topk_idx_iteration < self_num_iteration);
+    if (enable_prepare_topk) {
+        const int prepare_topk_token_idx = sm_id + prepare_topk_idx_iteration * num_sms;
+        const int4* src_addr = (
+            ((prepare_topk_idx_iow == 0)
+                ? reinterpret_cast<const int4*>(topk_idx_i32)
+                : reinterpret_cast<const int4*>(topk_weights))
+            + prepare_topk_token_idx * kNumActualTopkDivFour
+            + prepare_topk_idx_topkdivfour
+        );
+        temp_buf = ld_nc_global(src_addr);
+    }
+    // Wait all ranks to arrive
+    const int recv_flag_responsible_expert_idx = thread_id;
+    if (recv_flag_responsible_expert_idx < num_experts) {
+        while (ld_acquire_sys_global(rdma_recv_flag + recv_flag_responsible_expert_idx) == 0);
+    }
+
+    if (enable_prepare_topk) {
+        int4* smem_addr = compute_shared_topk_info_addr(prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topkdivfour);
+        *smem_addr = temp_buf;
+    }
+
+    __syncthreads();
 
     // Reduce tokens
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
     for (int hidden_idx = thread_id; hidden_idx < hidden_bf16_int4; hidden_idx += num_threads) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+        for (int idx_iteration = 0; idx_iteration < self_num_iteration; ++ idx_iteration) {
+            const int token_idx = sm_id + idx_iteration * num_sms;
+
             // Read top-k indices and weights
-            int reg_topk_idx[kNumMaxTopk];
-            float reg_topk_weights[kNumMaxTopk];
+            alignas(16) int reg_topk_idx[kNumMaxTopk];
+            alignas(16) float reg_topk_weights[kNumMaxTopk];
+            auto reg_topk_idx_vec = reinterpret_cast<int4*>(reg_topk_idx);
+            auto reg_topk_weights_vec = reinterpret_cast<float4*>(reg_topk_weights);
             #pragma unroll
-            for (int i = 0; i < num_topk; ++ i) {
-                reg_topk_idx[i] = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + i));
-                reg_topk_weights[i] = __ldg(topk_weights + token_idx * num_topk + i);
+            for (int i = 0; i < kNumActualTopkDivFour; ++i) {
+                reg_topk_idx_vec[i] = *compute_shared_topk_info_addr(idx_iteration, 0, i);
+            }
+            #pragma unroll
+            for (int i = 0; i < kNumActualTopkDivFour; ++i) {
+                reg_topk_weights_vec[i] = *reinterpret_cast<float4*>(compute_shared_topk_info_addr(idx_iteration, 1, i));
+            }
+
+            // Read from sources, Reduce
+            int4 zero4 = {0,0,0,0};
+            int4 x_vec[kNumActualTopk];
+            #pragma unroll
+            for (int i = 0; i < kNumActualTopk; ++i) {
+                auto rdma_buffer_type = reinterpret_cast<const int*>(static_cast<uint8_t*>(rdma_recv_x) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
+                auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
+                x_vec[i] = (reg_topk_idx[i] >= 0) ? ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id) : zero4;
             }
 
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
-            for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
-                // Read from sources
-                auto rdma_buffer_type = reinterpret_cast<const int*>(static_cast<uint8_t*>(rdma_recv_x) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
-                auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
-
-                // Reduce
-                auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + hidden_idx);
-                const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
-                #pragma unroll
-                for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                    combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
+            for (int i = 0; i < kNumActualTopk; ++i) {
+                if (reg_topk_idx[i] >= 0) {
+                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec[i]);
+                    #pragma unroll
+                    for (int j = 0; j < kNumElemsPerInt4; ++ j) combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
+                }
             }
 
             // Write results
@@ -665,7 +720,7 @@ combine(void* combined_x,
 
 void combine(void* combined_x,
              void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
-             const void* x, const int64_t* topk_idx, const float* topk_weights,
+             const void* x, const int32_t* topk_idx_i32, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
              int* next_clean, int num_next_clean_int,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
@@ -685,6 +740,7 @@ void combine(void* combined_x,
     auto atomic_clean_flag = static_cast<int*>(workspace);
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+    EP_HOST_ASSERT(num_combined_tokens <= kMaxNumTokensPerSm * num_sms);
 
     // Online cast cannot use zero-copy
     EP_HOST_ASSERT(not (zero_copy and use_logfmt));
@@ -700,7 +756,7 @@ SET_SHARED_MEMORY_FOR_TMA(combine_func); \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, \
               rdma_recv_x, rdma_recv_flag, rdma_send_x, \
-              x, topk_idx, topk_weights, src_info, layout_range, \
+              x, topk_idx_i32, topk_weights, src_info, layout_range, \
               next_clean, num_next_clean_int, \
               atomic_clean_flag, \
               num_combined_tokens, hidden, num_topk, \
