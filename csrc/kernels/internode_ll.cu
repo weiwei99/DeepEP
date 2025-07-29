@@ -622,21 +622,21 @@ combine(void* combined_x,
 
     int self_num_iteration = (sm_id >= num_combined_tokens) ? 0 : (1 + (num_combined_tokens - sm_id - 1) / num_sms);
 
-    alignas(16) __shared__ int4 shared_topk_info[kMaxNumTokensPerSm * kIdxOrWeightDim * kNumActualTopkDivFour];
-    const auto compute_shared_topk_info_addr = [=](int idx_iteration, int idx_iow, int idx_topkdivfour) {
+    __shared__ int shared_topk_info[kMaxNumTokensPerSm * kIdxOrWeightDim * kNumActualTopk];
+    const auto compute_shared_topk_info_addr = [=](int idx_iteration, int idx_iow, int idx_topk) {
         return shared_topk_info
             + idx_iteration * (kIdxOrWeightDim * kNumActualTopkDivFour)
-            + idx_iow * kNumActualTopkDivFour
-            + idx_topkdivfour;
+            + idx_iow * kNumActualTopk
+            + idx_topk;
     };
 
-    int4 temp_buf;
-    int prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topkdivfour;
+    int temp_buf;
+    int prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk;
     static_assert(sizeof(shared_topk_info) / sizeof(shared_topk_info[0]) <= kWarpSize);
     if (warp_id == 0) {
         int index = thread_id;
-        prepare_topk_idx_topkdivfour = index % kNumActualTopkDivFour;
-        index /= kNumActualTopkDivFour;
+        prepare_topk_idx_topk = index % kNumActualTopk;
+        index /= kNumActualTopk;
         prepare_topk_idx_iow = index % kIdxOrWeightDim;
         index /= kIdxOrWeightDim;
         prepare_topk_idx_iteration = index;
@@ -644,12 +644,12 @@ combine(void* combined_x,
     bool enable_prepare_topk = (warp_id == 0) and (prepare_topk_idx_iteration < self_num_iteration);
     if (enable_prepare_topk) {
         const int prepare_topk_token_idx = sm_id + prepare_topk_idx_iteration * num_sms;
-        const int4* src_addr = (
+        const int* src_addr = (
             ((prepare_topk_idx_iow == 0)
-                ? reinterpret_cast<const int4*>(topk_idx_i32)
-                : reinterpret_cast<const int4*>(topk_weights))
-            + prepare_topk_token_idx * kNumActualTopkDivFour
-            + prepare_topk_idx_topkdivfour
+                ? reinterpret_cast<const int*>(topk_idx_i32)
+                : reinterpret_cast<const int*>(topk_weights))
+            + prepare_topk_token_idx * kNumActualTopk
+            + prepare_topk_idx_topk
         );
         temp_buf = ld_nc_global(src_addr);
     }
@@ -660,7 +660,7 @@ combine(void* combined_x,
     }
 
     if (enable_prepare_topk) {
-        int4* smem_addr = compute_shared_topk_info_addr(prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topkdivfour);
+        int* smem_addr = compute_shared_topk_info_addr(prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk);
         *smem_addr = temp_buf;
     }
 
@@ -676,15 +676,13 @@ combine(void* combined_x,
             // Read top-k indices and weights
             alignas(16) int reg_topk_idx[kNumMaxTopk];
             alignas(16) float reg_topk_weights[kNumMaxTopk];
-            auto reg_topk_idx_vec = reinterpret_cast<int4*>(reg_topk_idx);
-            auto reg_topk_weights_vec = reinterpret_cast<float4*>(reg_topk_weights);
             #pragma unroll
-            for (int i = 0; i < kNumActualTopkDivFour; ++i) {
-                reg_topk_idx_vec[i] = *compute_shared_topk_info_addr(idx_iteration, 0, i);
+            for (int i = 0; i < kNumActualTopk; ++i) {
+                reg_topk_idx[i] = *compute_shared_topk_info_addr(idx_iteration, 0, i);
             }
             #pragma unroll
-            for (int i = 0; i < kNumActualTopkDivFour; ++i) {
-                reg_topk_weights_vec[i] = *reinterpret_cast<float4*>(compute_shared_topk_info_addr(idx_iteration, 1, i));
+            for (int i = 0; i < kNumActualTopk; ++i) {
+                reg_topk_weights[i] = *reinterpret_cast<float*>(compute_shared_topk_info_addr(idx_iteration, 1, i));
             }
 
             // Read from sources, Reduce
