@@ -633,7 +633,7 @@ combine(void* combined_x,
     int temp_buf;
     int prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk;
     static_assert(sizeof(shared_topk_info) / sizeof(shared_topk_info[0]) <= kWarpSize);
-    if (warp_id == 0) {
+    if (thread_id < sizeof(shared_topk_info) / sizeof(shared_topk_info[0])) {
         int index = thread_id;
         prepare_topk_idx_topk = index % kNumActualTopk;
         index /= kNumActualTopk;
@@ -641,7 +641,7 @@ combine(void* combined_x,
         index /= kIdxOrWeightDim;
         prepare_topk_idx_iteration = index;
     }
-    bool enable_prepare_topk = (warp_id == 0) and (prepare_topk_idx_iteration < self_num_iteration);
+    bool enable_prepare_topk = (thread_id < sizeof(shared_topk_info) / sizeof(shared_topk_info[0])) and (prepare_topk_idx_iteration < self_num_iteration);
     if (enable_prepare_topk) {
         const int prepare_topk_token_idx = sm_id + prepare_topk_idx_iteration * num_sms;
         const int* src_addr = (
