@@ -386,7 +386,7 @@ constexpr int kMaxNumTokensPerSm = 6;
 constexpr int kIdxOrWeightDim = 2;
 constexpr int kNumActualTopkDivFour = 2;
 constexpr int kNumActualTopk = kNumActualTopkDivFour * 4;
-constexpr int kWarpSize = 32;
+constexpr int kWarpSize = 64;
 
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(1024, 1) void
