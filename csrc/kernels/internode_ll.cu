@@ -625,7 +625,7 @@ combine(void* combined_x,
     __shared__ int shared_topk_info[kMaxNumTokensPerSm * kIdxOrWeightDim * kNumActualTopk];
     const auto compute_shared_topk_info_addr = [=](int idx_iteration, int idx_iow, int idx_topk) {
         return shared_topk_info
-            + idx_iteration * (kIdxOrWeightDim * kNumActualTopkDivFour)
+            + idx_iteration * (kIdxOrWeightDim * kNumActualTopk)
             + idx_iow * kNumActualTopk
             + idx_topk;
     };
@@ -654,7 +654,7 @@ combine(void* combined_x,
         temp_buf = ld_nc_global(src_addr);
     }
 
-    printf("step1: thread_id: %d, prepare_topk_idx_iteration: %d, prepare_topk_idx_iow: %d, prepare_topk_idx_topk: %d\n", thread_id, prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk);
+    //printf("step1: thread_id: %d, prepare_topk_idx_iteration: %d, prepare_topk_idx_iow: %d, prepare_topk_idx_topk: %d\n", thread_id, prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk);
     // Wait all ranks to arrive
     const int recv_flag_responsible_expert_idx = thread_id;
     if (recv_flag_responsible_expert_idx < num_experts) {
@@ -668,9 +668,9 @@ combine(void* combined_x,
 
     __syncthreads();
 
-    printf("step2: thread_id: %d, prepare_topk_idx_iteration: %d, prepare_topk_idx_iow: %d, prepare_topk_idx_topk: %d\n", thread_id, prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk);
+    //printf("step2: thread_id: %d, prepare_topk_idx_iteration: %d, prepare_topk_idx_iow: %d, prepare_topk_idx_topk: %d\n", thread_id, prepare_topk_idx_iteration, prepare_topk_idx_iow, prepare_topk_idx_topk);
 
-    return;
+    //return;
     // Reduce tokens
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
